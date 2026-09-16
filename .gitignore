@@ -1,0 +1,20 @@
+# 下载的数据集
+datasets/
+
+# 训练得到的模型权重
+checkpoints/
+*.pth
+*.pt
+
+# TensorBoard 训练日志
+runs/
+
+# Python 自动生成的缓存
+__pycache__/
+*.py[cod]
+
+# PyCharm 本地配置
+.idea/
+
+# 本地环境配置
+.env
