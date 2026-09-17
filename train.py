@@ -1,6 +1,6 @@
 # datetime用于为每次实验生成不同的日志名称。
 from datetime import datetime
-# Path用于处理日志和模型保存路径。
+# Path用于处理日志和模型保存路径。$
 from pathlib import Path
 # SummaryWriter负责向TensorBoard写入训练数据。
 from torch.utils.tensorboard import SummaryWriter
@@ -25,6 +25,23 @@ RANDOM_SEED = 42
 LEARNING_RATE = 1e-4
 # 当前Baseline正式训练10个Epoch。
 NUM_EPOCHS = 10
+# ============================================================
+# 当前实验配置
+# ============================================================
+
+# 每组实验必须使用清晰且唯一的名称。
+#
+# 这个名称会用于：
+# 1. TensorBoard日志文件夹；
+# 2. 最佳模型文件名；
+# 3. 检查点中的实验信息。
+EXPERIMENT_NAME = "label_smoothing_01"
+
+# 标签平滑系数。
+#
+# 0.0表示普通交叉熵；
+# 0.1表示拿出10%的权重与均匀分布混合。
+LABEL_SMOOTHING = 0.1
 
 # train.py就在项目根目录中，
 # 因此它的parent就是pet-classifier。
@@ -38,8 +55,14 @@ CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
 # pet-classifier/runs
 RUNS_DIR = PROJECT_ROOT / "runs"
 
-# 验证效果最好的模型保存路径。
-BEST_MODEL_PATH = CHECKPOINT_DIR / "best_model.pth"
+# 使用实验名称生成独立的模型文件名。
+#
+# 最终路径为：
+# checkpoints/label_smoothing_01_best.pth
+BEST_MODEL_PATH = (
+    CHECKPOINT_DIR
+    / f"{EXPERIMENT_NAME}_best.pth"
+)
 
 def train_one_batch():
     """
@@ -98,7 +121,12 @@ def train_one_batch():
     #
     # 注意：
     # 使用CrossEntropyLoss时，模型后面不要手动添加Softmax。
-    criterion = nn.CrossEntropyLoss()
+    # 创建带标签平滑的交叉熵损失。
+    #
+    # 当前LABEL_SMOOTHING为0.1。
+    criterion = nn.CrossEntropyLoss(
+        label_smoothing=LABEL_SMOOTHING,
+    )
 
     # 创建AdamW优化器。
     #
@@ -557,7 +585,8 @@ def main():
     device = torch.device(
         "cuda" if torch.cuda.is_available() else "cpu"
     )
-
+    print("实验名称：", EXPERIMENT_NAME)
+    print("标签平滑系数：", LABEL_SMOOTHING)
     print("===== Baseline正式训练 =====")
     print("训练设备：", device)
     print("训练轮数：", NUM_EPOCHS)
@@ -585,7 +614,13 @@ def main():
         "%Y%m%d_%H%M%S"
     )
 
-    run_name = f"baseline_{current_time}"
+    # 每次实验生成独立的TensorBoard日志目录。
+    #
+    # 例如：
+    # runs/label_smoothing_01_20260917_170000
+    run_name = (
+        f"{EXPERIMENT_NAME}_{current_time}"
+    )
     log_dir = RUNS_DIR / run_name
 
     # 创建TensorBoard日志写入器。
@@ -608,7 +643,19 @@ def main():
     model = build_model().to(device)
 
     # 创建交叉熵损失函数。
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(
+        label_smoothing=LABEL_SMOOTHING,
+    )
+
+    print(
+        "损失函数实际label_smoothing：",
+        criterion.label_smoothing,
+    )
+
+    assert (
+            criterion.label_smoothing
+            == LABEL_SMOOTHING
+    ), "损失函数没有正确应用标签平滑！"
 
     # 创建AdamW优化器。
     optimizer = torch.optim.AdamW(
@@ -745,6 +792,8 @@ def main():
                     "learning_rate": LEARNING_RATE,
                     "num_classes": 37,
                     "model_name": "resnet18",
+                    "experiment_name": EXPERIMENT_NAME,
+                    "label_smoothing": LABEL_SMOOTHING,
                 }
 
                 torch.save(
