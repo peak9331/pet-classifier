@@ -1,300 +1,75 @@
-# datetime用于为每次实验生成不同的日志名称。
+"""训练入口：必须显式指定实验名称；导入模块或查看帮助不会开始训练。"""
+import argparse
+import math
+import os
+import random
+import re
 from datetime import datetime
-# Path用于处理日志和模型保存路径。$
 from pathlib import Path
-# SummaryWriter负责向TensorBoard写入训练数据。
-from torch.utils.tensorboard import SummaryWriter
+from uuid import uuid4
+
+import numpy as np
 import torch
 from torch import nn
-# tqdm可以显示训练进度条。
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-# 导入刚才完成的数据加载函数。
-from data.dataset import create_dataloaders
 
-# 导入刚才完成的模型创建函数。
+from data.dataset import create_dataloaders
 from models.model import build_model
 
-
-# 固定随机种子，尽量让实验结果可以复现。
-RANDOM_SEED = 42
-
-# 学习率控制模型每次更新参数的幅度。
-#
-# 1e-4 等于 0.0001。
-# 对预训练模型进行微调时，通常使用比较小的学习率。
-LEARNING_RATE = 1e-4
-# 当前Baseline正式训练10个Epoch。
-NUM_EPOCHS = 10
-# ============================================================
-# 当前实验配置
-# ============================================================
-
-# 每组实验必须使用清晰且唯一的名称。
-#
-# 这个名称会用于：
-# 1. TensorBoard日志文件夹；
-# 2. 最佳模型文件名；
-# 3. 检查点中的实验信息。
-EXPERIMENT_NAME = "label_smoothing_01"
-
-# 标签平滑系数。
-#
-# 0.0表示普通交叉熵；
-# 0.1表示拿出10%的权重与均匀分布混合。
-LABEL_SMOOTHING = 0.1
-
-# train.py就在项目根目录中，
-# 因此它的parent就是pet-classifier。
 PROJECT_ROOT = Path(__file__).resolve().parent
-
-# 模型权重保存目录：
-# pet-classifier/checkpoints
 CHECKPOINT_DIR = PROJECT_ROOT / "checkpoints"
-
-# TensorBoard日志根目录：
-# pet-classifier/runs
 RUNS_DIR = PROJECT_ROOT / "runs"
+# 历史安全模型永远不能由本入口覆盖，即使指定 --overwrite。
+PROTECTED_CHECKPOINTS = {
+    (CHECKPOINT_DIR / "baseline_ce_best.pth").resolve(),
+    (CHECKPOINT_DIR / "label_smoothing_01_completed.pth").resolve(),
+}
 
-# 使用实验名称生成独立的模型文件名。
-#
-# 最终路径为：
-# checkpoints/label_smoothing_01_best.pth
-BEST_MODEL_PATH = (
-    CHECKPOINT_DIR
-    / f"{EXPERIMENT_NAME}_best.pth"
-)
 
-def train_one_batch():
-    """
-    使用一个Batch完成一次最小训练。
+def parse_args(argv=None):
+    """先校验参数，再创建模型和日志，防止误点击启动训练。"""
+    parser = argparse.ArgumentParser(description="宠物分类训练（必须显式指定实验名称）")
+    parser.add_argument("--experiment-name", required=True, help="新实验名称，只允许英文字母、数字、_ 和 -")
+    parser.add_argument("--epochs", type=int, default=10)
+    parser.add_argument("--batch-size", type=int, default=32)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    # 原 AdamW 未指定此参数，实际默认值为 0.01，现显式保留。
+    parser.add_argument("--weight-decay", type=float, default=0.01)
+    parser.add_argument("--label-smoothing", type=float, default=0.0, help="0 为 Baseline；0.1 为标签平滑")
+    parser.add_argument("--seed", type=int, default=42, help="训练随机种子；数据划分仍固定为 42")
+    parser.add_argument("--num-workers", type=int, default=0)
+    parser.add_argument("--overwrite", action="store_true", help="允许覆盖同名普通模型；安全模型始终受保护")
+    args = parser.parse_args(argv)
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", args.experiment_name):
+        parser.error("实验名称只能包含英文字母、数字、_ 和 -，且以字母或数字开头。")
+    if args.epochs <= 0 or args.batch_size <= 0 or args.num_workers < 0:
+        parser.error("epochs 和 batch-size 必须为正数；num-workers 不能为负数。")
+    if not math.isfinite(args.lr) or args.lr <= 0:
+        parser.error("lr 必须是有限正数。")
+    if not math.isfinite(args.weight_decay) or args.weight_decay < 0:
+        parser.error("weight-decay 必须是有限非负数。")
+    if not 0 <= args.label_smoothing <= 1:
+        parser.error("label-smoothing 必须在 [0, 1] 内。")
+    if not 0 <= args.seed < 2**32:
+        parser.error("seed 必须在 [0, 2**32) 内。")
+    return args
 
-    这个函数不是完整训练循环，
-    它只验证以下组件能否正确配合：
 
-    1. DataLoader
-    2. ResNet18
-    3. GPU
-    4. CrossEntropyLoss
-    5. AdamW
-    6. 反向传播
-    """
+def validate_checkpoint_target(checkpoint_path, overwrite=False):
+    """只检查路径，不写文件；保护检查必须早于模型和日志初始化。"""
+    if (
+            checkpoint_path.exists()
+            and checkpoint_path.resolve() in PROTECTED_CHECKPOINTS
+    ):
+        raise ValueError(f"安全模型禁止覆盖：{checkpoint_path}。请使用新的 --experiment-name。")
+    if checkpoint_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"目标 checkpoint 已存在：{checkpoint_path}。请更换实验名称；"
+            "确需覆盖普通模型时显式加入 --overwrite。"
+        )
 
-    # 固定PyTorch的随机种子。
-    torch.manual_seed(RANDOM_SEED)
 
-    # 如果CUDA可用就使用GPU，否则使用CPU。
-    #
-    # device最终会是：
-    # torch.device("cuda")
-    # 或者：
-    # torch.device("cpu")
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-
-    print("===== 创建训练组件 =====")
-    print("训练设备：", device)
-
-    # 创建训练集、验证集和测试集的DataLoader。
-    #
-    # 当前只使用train_loader，
-    # 但先接收全部三个返回值，方便以后扩展完整训练循环。
-    train_loader, val_loader, test_loader = (
-        create_dataloaders()
-    )
-
-    # 创建37分类的ResNet18模型。
-    model = build_model()
-
-    # 将模型中的所有参数移动到GPU。
-    #
-    # 如果不执行这一行，模型仍然在CPU上。
-    model = model.to(device)
-
-    # 创建交叉熵损失函数。
-    #
-    # CrossEntropyLoss用于多分类问题。
-    #
-    # 它接收：
-    # 1. 模型输出的logits，形状为[32, 37]
-    # 2. 正确标签，形状为[32]
-    #
-    # 注意：
-    # 使用CrossEntropyLoss时，模型后面不要手动添加Softmax。
-    # 创建带标签平滑的交叉熵损失。
-    #
-    # 当前LABEL_SMOOTHING为0.1。
-    criterion = nn.CrossEntropyLoss(
-        label_smoothing=LABEL_SMOOTHING,
-    )
-
-    # 创建AdamW优化器。
-    #
-    # model.parameters()表示模型中所有需要学习的参数。
-    #
-    # lr表示learning rate，也就是学习率。
-    #
-    # 优化器的任务是：
-    # 根据参数的梯度，实际修改模型参数。
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LEARNING_RATE,
-    )
-
-    # 从训练集中取得第一个Batch。
-    #
-    # images形状为：
-    # [32, 3, 224, 224]
-    #
-    # labels形状为：
-    # [32]
-    images, labels = next(iter(train_loader))
-
-    # 将图片和标签从CPU内存移动到GPU显存。
-    #
-    # 模型和数据必须位于同一个设备上。
-    # 不能让模型在GPU、图片却在CPU。
-    images = images.to(
-        device,
-        non_blocking=True,
-    )
-
-    labels = labels.to(
-        device,
-        non_blocking=True,
-    )
-
-    # 切换到训练模式。
-    #
-    # model.train()不会立即开始训练，
-    # 它只是告诉模型：
-    # “接下来的操作属于训练阶段。”
-    model.train()
-
-    # 保存更新前最后一层的参数。
-    #
-    # detach()表示这里只读取参数，不加入梯度计算。
-    # clone()表示复制一份，防止后面参数变化影响这份记录。
-    weight_before = model.fc.weight.detach().clone()
-
-    # 清空上一次计算留下的梯度。
-    #
-    # PyTorch默认会累加梯度。
-    # 如果不清空，本次梯度会和之前的梯度加在一起。
-    optimizer.zero_grad()
-
-    # ========================================================
-    # 第一步：前向传播
-    # ========================================================
-
-    # 将32张图片送入模型。
-    logits = model(images)
-
-    # logits形状应为：
-    # [32, 37]
-    #
-    # 每一行代表一张图片，
-    # 每一列代表一个宠物类别的预测分数。
-    print()
-    print("===== 前向传播 =====")
-    print("输入图片形状：", images.shape)
-    print("正确标签形状：", labels.shape)
-    print("模型输出形状：", logits.shape)
-
-    # ========================================================
-    # 第二步：计算损失
-    # ========================================================
-
-    # 将模型预测与正确标签进行比较。
-    #
-    # loss是一个数值，用于表示模型当前错得有多严重。
-    # 通常loss越小越好。
-    loss = criterion(logits, labels)
-
-    print("当前Batch损失：", loss.item())
-
-    # ========================================================
-    # 第三步：反向传播
-    # ========================================================
-
-    # 根据loss计算每个模型参数应该如何改变。
-    #
-    # backward()只计算梯度，
-    # 还没有真正修改模型参数。
-    loss.backward()
-
-    # ========================================================
-    # 第四步：更新参数
-    # ========================================================
-
-    # 优化器根据刚才计算出的梯度修改模型参数。
-    optimizer.step()
-
-    # 保存更新后的最后一层参数。
-    weight_after = model.fc.weight.detach().clone()
-
-    # 计算参数更新前后的平均变化量。
-    #
-    # 只要结果大于0，就说明优化器确实修改了参数。
-    average_weight_change = (
-        weight_after - weight_before
-    ).abs().mean().item()
-
-    # ========================================================
-    # 第五步：计算当前Batch准确率
-    # ========================================================
-
-    # logits中每一行有37个类别分数。
-    #
-    # argmax(dim=1)会找到每张图片分数最高的类别编号。
-    predictions = logits.argmax(dim=1)
-
-    # 判断预测类别是否等于正确标签。
-    correct_count = (
-        predictions == labels
-    ).sum().item()
-
-    # 当前Batch一共有多少张图片。
-    batch_size = labels.size(0)
-
-    # 计算当前Batch的准确率。
-    batch_accuracy = correct_count / batch_size
-
-    print()
-    print("===== 参数更新检查 =====")
-    print("正确预测数量：", correct_count)
-    print("当前Batch图片数量：", batch_size)
-    print(
-        f"当前Batch准确率："
-        f"{batch_accuracy:.2%}"
-    )
-    print(
-        "最后一层参数平均变化量：",
-        average_weight_change,
-    )
-
-    # ========================================================
-    # 第六步：自动检查关键结果
-    # ========================================================
-
-    # 32张图片必须分别输出37个类别分数。
-    assert logits.shape == (
-        batch_size,
-        37,
-    )
-
-    # 损失必须是一个正常的有限数值。
-    #
-    # 如果出现NaN或无穷大，
-    # 通常说明数据、学习率或计算过程存在问题。
-    assert torch.isfinite(loss)
-
-    # 参数变化量必须大于0。
-    # 否则说明优化器没有成功更新模型。
-    assert average_weight_change > 0
-
-    print()
-    print("一次Batch训练成功！")
 def train_one_epoch(
     model,
     train_loader,
@@ -563,274 +338,102 @@ def validate_one_epoch(
     val_accuracy = total_correct / total_samples
 
     return val_loss, val_accuracy
-def main():
-    """
-    完成正式Baseline训练：
-
-    1. 创建数据、模型、损失函数和优化器；
-    2. 循环训练10个Epoch；
-    3. 每个Epoch结束后进行验证；
-    4. 将结果写入TensorBoard；
-    5. 自动保存验证准确率最高的模型。
-    """
-
-    # 固定CPU上的PyTorch随机种子。
-    torch.manual_seed(RANDOM_SEED)
-
-    # 如果使用GPU，也固定GPU随机种子。
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(RANDOM_SEED)
-
-    # 优先使用GPU。
-    device = torch.device(
-        "cuda" if torch.cuda.is_available() else "cpu"
-    )
-    print("实验名称：", EXPERIMENT_NAME)
-    print("标签平滑系数：", LABEL_SMOOTHING)
-    print("===== Baseline正式训练 =====")
-    print("训练设备：", device)
-    print("训练轮数：", NUM_EPOCHS)
-    print("学习率：", LEARNING_RATE)
-
-    # 如果checkpoints目录不存在，就自动创建。
-    #
-    # parents=True：
-    # 如果上级目录缺失，也一并创建。
-    #
-    # exist_ok=True：
-    # 如果目录已经存在，不要报错。
-    CHECKPOINT_DIR.mkdir(
-        parents=True,
-        exist_ok=True,
-    )
-
-    # 为本次实验生成时间名称。
-    #
-    # 例如：
-    # baseline_20260916_153025
-    #
-    # 这样多次训练的TensorBoard日志不会混在一起。
-    current_time = datetime.now().strftime(
-        "%Y%m%d_%H%M%S"
-    )
-
-    # 每次实验生成独立的TensorBoard日志目录。
-    #
-    # 例如：
-    # runs/label_smoothing_01_20260917_170000
-    run_name = (
-        f"{EXPERIMENT_NAME}_{current_time}"
-    )
-    log_dir = RUNS_DIR / run_name
-
-    # 创建TensorBoard日志写入器。
-    writer = SummaryWriter(
-        log_dir=str(log_dir)
-    )
-
-    print("TensorBoard日志：", log_dir)
-    print("最佳模型路径：", BEST_MODEL_PATH)
-
-    # 创建DataLoader。
-    #
-    # 当前正式训练只使用训练集和验证集。
-    # 测试集仍然保持封闭，等模型训练结束后再使用。
-    train_loader, val_loader, _ = (
-        create_dataloaders()
-    )
-
-    # 创建预训练ResNet18，并移动到GPU。
-    model = build_model().to(device)
-
-    # 创建交叉熵损失函数。
-    criterion = nn.CrossEntropyLoss(
-        label_smoothing=LABEL_SMOOTHING,
-    )
-
-    print(
-        "损失函数实际label_smoothing：",
-        criterion.label_smoothing,
-    )
-
-    assert (
-            criterion.label_smoothing
-            == LABEL_SMOOTHING
-    ), "损失函数没有正确应用标签平滑！"
-
-    # 创建AdamW优化器。
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=LEARNING_RATE,
-    )
-
-    # 记录目前最好的验证准确率。
-    #
-    # 设置成-1，确保第一个Epoch一定会保存。
-    best_val_accuracy = -1.0
-
+def main(argv=None):
+    args = parse_args(argv)
+    checkpoint_path = CHECKPOINT_DIR / f"{args.experiment_name}_best.pth"
+    # 任何训练、数据读取和 TensorBoard 写入之前，先拒绝危险目标。
+    validate_checkpoint_target(checkpoint_path, args.overwrite)
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    lock_path = checkpoint_path.with_suffix(".lock")
+    # x 模式只允许新建，避免两个本脚本进程同时写同一个实验。
     try:
-        # range(1, 11)会依次产生1～10。
-        for epoch_number in range(
-            1,
-            NUM_EPOCHS + 1,
-        ):
-            print()
-            print(
-                f"========== "
-                f"Epoch {epoch_number}/{NUM_EPOCHS} "
-                f"=========="
-            )
+        lock_file = lock_path.open("x", encoding="utf-8")
+    except FileExistsError as exc:
+        raise RuntimeError(f"实验已被锁定：{lock_path}。确认没有训练进程后再人工处理遗留锁。") from exc
 
-            # ================================================
-            # 1. 训练一个Epoch
-            # ================================================
-
+    writer = None
+    # 唯一临时文件名，清理时不会误删其他任务留下的文件。
+    temp_path = checkpoint_path.with_name(f".{checkpoint_path.stem}.{uuid4().hex}.tmp")
+    has_saved = False
+    try:
+        validate_checkpoint_target(checkpoint_path, args.overwrite)
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        train_loader, val_loader, _ = create_dataloaders(
+            batch_size=args.batch_size, num_workers=args.num_workers, download=False,
+        )
+        model = build_model().to(device)
+        # 两组实验共用同一训练流程，唯一的消融变量是此处的平滑系数。
+        # 模型直接输出 logits，CrossEntropyLoss 前不添加 Softmax。
+        criterion = nn.CrossEntropyLoss(label_smoothing=args.label_smoothing)
+        assert criterion.label_smoothing == args.label_smoothing
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay,
+        )
+        log_dir = RUNS_DIR / (
+            f"{args.experiment_name}_{datetime.now():%Y%m%d_%H%M%S_%f}"
+        )
+        log_dir.mkdir(parents=True, exist_ok=False)
+        writer = SummaryWriter(log_dir=str(log_dir))
+        writer.add_text("Config", str(vars(args)), 0)
+        print("训练设备：", device)
+        print("实际配置：", vars(args))
+        print("损失函数实际 label_smoothing：", criterion.label_smoothing)
+        print("TensorBoard 日志：", log_dir)
+        print("最佳模型路径：", checkpoint_path)
+        best_val_accuracy = -1.0
+        for epoch in range(1, args.epochs + 1):
             train_loss, train_accuracy = train_one_epoch(
-                model=model,
-                train_loader=train_loader,
-                criterion=criterion,
-                optimizer=optimizer,
-                device=device,
-                epoch_number=epoch_number,
+                model, train_loader, criterion, optimizer, device, epoch,
             )
-
-            # ================================================
-            # 2. 验证一个Epoch
-            # ================================================
-
             val_loss, val_accuracy = validate_one_epoch(
-                model=model,
-                val_loader=val_loader,
-                criterion=criterion,
-                device=device,
-                epoch_number=epoch_number,
+                model, val_loader, criterion, device, epoch,
             )
-
-            # ================================================
-            # 3. 打印当前Epoch结果
-            # ================================================
-
-            print()
-            print(
-                f"Epoch {epoch_number}结果："
-            )
-            print(
-                f"Train Loss：{train_loss:.4f}"
-            )
-            print(
-                f"Train Accuracy："
-                f"{train_accuracy:.2%}"
-            )
-            print(
-                f"Val Loss：{val_loss:.4f}"
-            )
-            print(
-                f"Val Accuracy："
-                f"{val_accuracy:.2%}"
-            )
-
-            # ================================================
-            # 4. 写入TensorBoard
-            # ================================================
-
-            # 把训练损失和验证损失写在同一张图中。
-            writer.add_scalars(
-                main_tag="Loss",
-                tag_scalar_dict={
-                    "Train": train_loss,
-                    "Validation": val_loss,
-                },
-                global_step=epoch_number,
-            )
-
-            # 把训练准确率和验证准确率写在同一张图中。
-            writer.add_scalars(
-                main_tag="Accuracy",
-                tag_scalar_dict={
-                    "Train": train_accuracy,
-                    "Validation": val_accuracy,
-                },
-                global_step=epoch_number,
-            )
-
-            # 立即将本轮数据写入磁盘。
+            writer.add_scalars("Loss", {"Train": train_loss, "Validation": val_loss}, epoch)
+            writer.add_scalars("Accuracy", {"Train": train_accuracy, "Validation": val_accuracy}, epoch)
             writer.flush()
-
-            # ================================================
-            # 5. 判断是否保存最佳模型
-            # ================================================
-
-            # 只根据验证准确率选择模型。
-            #
-            # 不能根据测试集结果选择模型，
-            # 否则会造成测试集信息泄漏。
+            print(
+                f"Epoch {epoch}/{args.epochs} | Train Loss {train_loss:.4f}, "
+                f"Accuracy {train_accuracy:.2%} | Val Loss {val_loss:.4f}, "
+                f"Accuracy {val_accuracy:.2%}"
+            )
+            # 只以验证集选最佳模型；不在训练中查看测试集指标。
             if val_accuracy > best_val_accuracy:
-                old_best_accuracy = best_val_accuracy
-                best_val_accuracy = val_accuracy
-
-                # checkpoint不只保存模型参数，
-                # 还保存当前Epoch、优化器状态和实验指标。
                 checkpoint = {
-                    "epoch": epoch_number,
-
-                    # 模型学习到的参数。
-                    "model_state_dict": (
-                        model.state_dict()
-                    ),
-
-                    # 优化器内部状态。
-                    # 以后如果需要续训，可以恢复。
-                    "optimizer_state_dict": (
-                        optimizer.state_dict()
-                    ),
-
-                    # 当前最佳验证结果。
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
                     "val_accuracy": val_accuracy,
                     "val_loss": val_loss,
-
-                    # 保存关键训练配置。
-                    "learning_rate": LEARNING_RATE,
+                    "learning_rate": args.lr,
                     "num_classes": 37,
                     "model_name": "resnet18",
-                    "experiment_name": EXPERIMENT_NAME,
-                    "label_smoothing": LABEL_SMOOTHING,
+                    "experiment_name": args.experiment_name,
+                    "label_smoothing": args.label_smoothing,
+                    "config": vars(args),
+                    "split_seed": 42,
+                    "log_dir": str(log_dir.relative_to(PROJECT_ROOT)),
                 }
-
-                torch.save(
-                    checkpoint,
-                    BEST_MODEL_PATH,
-                )
-
-                print(
-                    "发现更好的模型："
-                    f"{old_best_accuracy:.2%}"
-                    " → "
-                    f"{best_val_accuracy:.2%}"
-                )
-                print(
-                    "已保存到：",
-                    BEST_MODEL_PATH,
-                )
-            else:
-                print(
-                    "本轮未超过最佳验证准确率："
-                    f"{best_val_accuracy:.2%}"
-                )
-
+                # 先写临时文件再替换，避免保存中断留下半个 checkpoint。
+                # 第一次保存仍检查同名文件，防止启动后被其他程序创建。
+                validate_checkpoint_target(checkpoint_path, args.overwrite or has_saved)
+                torch.save(checkpoint, temp_path)
+                os.replace(temp_path, checkpoint_path)
+                has_saved = True
+                best_val_accuracy = val_accuracy
+                print(f"已保存最佳模型：{checkpoint_path}（{best_val_accuracy:.2%}）")
+        print(f"训练完成，最佳验证准确率：{best_val_accuracy:.2%}")
     finally:
-        # 无论训练正常结束还是中途出错，
-        # 都尝试关闭TensorBoard写入器。
-        writer.close()
+        if writer is not None:
+            writer.close()
+        lock_file.close()
+        lock_path.unlink(missing_ok=True)
+        temp_path.unlink(missing_ok=True)
 
-    print()
-    print("===== Baseline训练完成 =====")
-    print(
-        "最佳验证准确率：",
-        f"{best_val_accuracy:.2%}",
-    )
-    print(
-        "最佳模型保存位置：",
-        BEST_MODEL_PATH,
-    )
+
 if __name__ == "__main__":
     main()

@@ -39,9 +39,9 @@ BATCH_SIZE = 32
 # 2. 下载并加载原始数据
 # ============================================================
 
-def load_raw_datasets():
+def load_raw_datasets(download=False):
     """
-    下载并加载 Oxford-IIIT Pet 的两个官方数据部分。
+    读取 Oxford-IIIT Pet 的两个官方数据部分；仅显式 download=True 时下载。
 
     当前函数只负责读取原始数据，不负责：
     1. 重新划分训练集、验证集、测试集；
@@ -58,9 +58,8 @@ def load_raw_datasets():
         # 标签取值为0～36，共37种。
         target_types="category",
 
-        # 如果数据不存在就自动下载；
-        # 如果已经下载完成，就直接读取，不会重复下载。
-        download=True,
+        # 默认只读本地数据；缺失时明确报错，不在评估时自动下载或改写。
+        download=download,
     )
 
     # 官方的 test 部分包含3669张图片。
@@ -68,7 +67,7 @@ def load_raw_datasets():
         root=DATA_ROOT,
         split="test",
         target_types="category",
-        download=True,
+        download=download,
     )
 
     return trainval_dataset, test_dataset
@@ -360,11 +359,11 @@ class TransformedSubset(Dataset):
 # 8. 创建DataLoader
 # ============================================================
 
-def create_dataloaders(batch_size=BATCH_SIZE):
+def create_dataloaders(batch_size=BATCH_SIZE, num_workers=0, download=False):
     """
     完成完整的数据流水线：
 
-    下载数据
+    读取本地数据（默认禁止自动下载）
         ↓
     合并数据
         ↓
@@ -375,9 +374,9 @@ def create_dataloaders(batch_size=BATCH_SIZE):
     创建DataLoader
     """
 
-    # 下载并读取两个官方部分。
+    # 默认只读两个官方部分，防止评估任务意外改写 datasets。
     trainval_dataset, official_test_dataset = (
-        load_raw_datasets()
+        load_raw_datasets(download=download)
     )
 
     # 合并成完整数据集，并取得所有标签。
@@ -429,7 +428,7 @@ def create_dataloaders(batch_size=BATCH_SIZE):
 
         # Windows下先使用0，表示由主进程加载数据。
         # 这样最稳定。跑通后再尝试调整到2或4。
-        num_workers=0,
+        num_workers=num_workers,
 
         # 使用GPU时，锁页内存可以加快CPU到GPU的数据传输。
         pin_memory=torch.cuda.is_available(),
@@ -440,7 +439,7 @@ def create_dataloaders(batch_size=BATCH_SIZE):
         dataset=val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
     )
 
@@ -449,7 +448,7 @@ def create_dataloaders(batch_size=BATCH_SIZE):
         dataset=test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=0,
+        num_workers=num_workers,
         pin_memory=torch.cuda.is_available(),
     )
 

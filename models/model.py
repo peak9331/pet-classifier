@@ -7,7 +7,7 @@ from torchvision.models import ResNet18_Weights, resnet18
 NUM_CLASSES = 37
 
 
-def build_model(num_classes=NUM_CLASSES):
+def build_model(num_classes=NUM_CLASSES, pretrained=True):
     """
     创建用于宠物品种分类的ResNet18模型。
 
@@ -24,7 +24,8 @@ def build_model(num_classes=NUM_CLASSES):
     #
     # “预训练”表示ResNet18之前已经在ImageNet数据集上
     # 学习过大量通用图像特征，例如边缘、纹理、形状等。
-    weights = ResNet18_Weights.DEFAULT
+    # 训练默认使用预训练权重；评估直接载入 checkpoint，不额外下载权重。
+    weights = ResNet18_Weights.DEFAULT if pretrained else None
 
     # 创建ResNet18，并载入预训练参数。
     # 第一次运行时可能会自动下载约45MB的模型权重。

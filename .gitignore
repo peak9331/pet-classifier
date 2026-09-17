@@ -1,20 +1,30 @@
-# 下载的数据集
+# 数据集
 datasets/
 
-# 训练得到的模型权重
+# 模型权重
 checkpoints/
 *.pth
 *.pt
+*.lock
+*.tmp
 
-# TensorBoard 训练日志
-runs/
+# 默认忽略训练日志，只保留两次正式实验
+runs/*
+!runs/baseline_20260916_234335/
+!runs/baseline_20260916_234335/**
+!runs/label_smoothing_01_20260917_200651/
+!runs/label_smoothing_01_20260917_200651/**
 
-# Python 自动生成的缓存
+# Python 缓存
 __pycache__/
 *.py[cod]
 
-# PyCharm 本地配置
+# PyCharm 配置
 .idea/
 
-# 本地环境配置
+# 本地环境
 .env
+
+# 本地备份和绝对路径来源记录
+outputs/experiment_results_before_day3.csv
+outputs/training_curves.sources.json

@@ -1,13 +1,21 @@
 --extra-index-url https://download.pytorch.org/whl/cu126
 
+# 深度学习框架和图像模型
 torch==2.13.0
 torchvision==0.28.0
 
-numpy
-Pillow
-matplotlib
-pandas
-scikit-learn
-tensorboard
-tqdm
-seaborn
+# 数值计算与图像处理
+numpy==2.5.3
+Pillow==12.3.0
+
+# 数据分析与可视化
+matplotlib==3.11.2
+pandas==3.0.5
+seaborn==0.13.2
+
+# 模型评估与数据划分
+scikit-learn==1.9.1
+
+# 训练日志与进度显示
+tensorboard==2.21.0
+tqdm==4.70.1
