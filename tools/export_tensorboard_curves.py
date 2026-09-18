@@ -80,7 +80,9 @@ def select_run(runs, checkpoint, expected_epochs, explicit_dir, prefixes):
     if len(candidates) != 1:
         raise ValueError(
             f"满足条件的实验有 {len(candidates)} 个，无法唯一确定。"
-            "请核对上方目录/标签，并用 --baseline-run / --label-smoothing-run 指定。"
+            "请核对上方目录和标签，或者使用对应的 "
+            "--baseline-run、--label-smoothing-run、"
+            "--randaugment-run 参数显式指定。"
         )
     return candidates[0]
 
@@ -90,8 +92,20 @@ def main(argv=None):
     parser.add_argument("--runs-dir", type=Path, default=PROJECT_ROOT / "runs")
     parser.add_argument("--baseline-run", type=Path)
     parser.add_argument("--label-smoothing-run", type=Path)
+    parser.add_argument(
+        "--randaugment-run",
+        type=Path,
+    )
     parser.add_argument("--epochs", type=int, default=10, help="日志必须完整覆盖 1～N 轮")
-    parser.add_argument("--output", type=Path, default=PROJECT_ROOT / "outputs" / "training_curves.png")
+    parser.add_argument(
+        "--output",
+        type=Path,
+        default=(
+                PROJECT_ROOT
+                / "outputs"
+                / "training_curves_3_experiments.png"
+        ),
+    )
     args = parser.parse_args(argv)
     if args.epochs <= 0:
         parser.error("--epochs 必须大于 0")
@@ -103,8 +117,24 @@ def main(argv=None):
             raise ValueError("没有发现实验目录，不生成曲线。")
         selected = []
         for name, filename, explicit, prefixes in [
-            ("Baseline CE", "baseline_ce_best.pth", args.baseline_run, ("baseline_",)),
-            ("Label Smoothing 0.1", "label_smoothing_01_best.pth", args.label_smoothing_run, ("label_smoothing_01_",)),
+            (
+                    "Baseline CE",
+                    "baseline_ce_best.pth",
+                    args.baseline_run,
+                    ("baseline_ce_", "baseline_"),
+            ),
+            (
+                    "Label Smoothing 0.1",
+                    "label_smoothing_01_best.pth",
+                    args.label_smoothing_run,
+                    ("label_smoothing_01_",),
+            ),
+            (
+                    "RandAugment N2 M9",
+                    "randaugment_n2_m9_best.pth",
+                    args.randaugment_run,
+                    ("randaugment_n2_m9_",),
+            ),
         ]:
             checkpoint_path = PROJECT_ROOT / "checkpoints" / filename
             checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
@@ -118,7 +148,13 @@ def main(argv=None):
         if source_path.exists():
             raise ValueError(f"来源记录已存在：{source_path}；请指定新的 --output。")
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        figure, axes = plt.subplots(2, 2, figsize=(14, 9), sharex=True)
+        figure, axes = plt.subplots(
+            2,
+            len(selected),
+            figsize=(20, 9),
+            sharex=True,
+            squeeze=False,
+        )
         provenance = []
         try:
             for column, (name, run, checkpoint_path) in enumerate(selected):

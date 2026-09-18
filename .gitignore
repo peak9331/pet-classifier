@@ -28,3 +28,5 @@ __pycache__/
 # 本地备份和绝对路径来源记录
 outputs/experiment_results_before_day3.csv
 outputs/training_curves.sources.json
+# 其他用户在本机重新评估生成的结果
+outputs/reproduced_experiment_results.csv

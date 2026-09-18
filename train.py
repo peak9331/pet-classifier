@@ -37,6 +37,12 @@ def parse_args(argv=None):
     # 原 AdamW 未指定此参数，实际默认值为 0.01，现显式保留。
     parser.add_argument("--weight-decay", type=float, default=0.01)
     parser.add_argument("--label-smoothing", type=float, default=0.0, help="0 为 Baseline；0.1 为标签平滑")
+    parser.add_argument(
+        "--augmentation",
+        choices=["basic", "randaugment"],
+        default="basic",
+        help="训练集增强方式；验证集和测试集始终使用固定预处理",
+    )
     parser.add_argument("--seed", type=int, default=42, help="训练随机种子；数据划分仍固定为 42")
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--overwrite", action="store_true", help="允许覆盖同名普通模型；安全模型始终受保护")
@@ -56,19 +62,31 @@ def parse_args(argv=None):
     return args
 
 
-def validate_checkpoint_target(checkpoint_path, overwrite=False):
-    """只检查路径，不写文件；保护检查必须早于模型和日志初始化。"""
+def validate_checkpoint_target(
+    checkpoint_path,
+    overwrite=False,
+):
+    """检查目标模型路径，防止覆盖已有的重要模型。"""
+
+    # 只有安全模型真实存在时才禁止覆盖。
+    # 干净克隆的仓库中没有 checkpoint，因此允许首次复现实验。
     if (
-            checkpoint_path.exists()
-            and checkpoint_path.resolve() in PROTECTED_CHECKPOINTS
+        checkpoint_path.exists()
+        and checkpoint_path.resolve() in PROTECTED_CHECKPOINTS
     ):
-        raise ValueError(f"安全模型禁止覆盖：{checkpoint_path}。请使用新的 --experiment-name。")
-    if checkpoint_path.exists() and not overwrite:
-        raise FileExistsError(
-            f"目标 checkpoint 已存在：{checkpoint_path}。请更换实验名称；"
-            "确需覆盖普通模型时显式加入 --overwrite。"
+        raise ValueError(
+            f"安全模型禁止覆盖：{checkpoint_path}。"
+            "请使用新的 --experiment-name。"
         )
 
+    # 普通模型如果已经存在，默认也不覆盖；
+    # 只有显式使用 --overwrite 才允许覆盖。
+    if checkpoint_path.exists() and not overwrite:
+        raise FileExistsError(
+            f"目标 checkpoint 已存在：{checkpoint_path}。"
+            "请更换实验名称；"
+            "确需覆盖普通模型时显式加入 --overwrite。"
+        )
 
 def train_one_epoch(
     model,
@@ -364,7 +382,10 @@ def main(argv=None):
             torch.cuda.manual_seed_all(args.seed)
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         train_loader, val_loader, _ = create_dataloaders(
-            batch_size=args.batch_size, num_workers=args.num_workers, download=False,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            download=False,
+            augmentation=args.augmentation,
         )
         model = build_model().to(device)
         # 两组实验共用同一训练流程，唯一的消融变量是此处的平滑系数。
@@ -414,13 +435,15 @@ def main(argv=None):
                     "model_name": "resnet18",
                     "experiment_name": args.experiment_name,
                     "label_smoothing": args.label_smoothing,
+                    "augmentation": args.augmentation,
                     "config": vars(args),
                     "split_seed": 42,
                     "log_dir": str(log_dir.relative_to(PROJECT_ROOT)),
                 }
                 # 先写临时文件再替换，避免保存中断留下半个 checkpoint。
                 # 第一次保存仍检查同名文件，防止启动后被其他程序创建。
-                validate_checkpoint_target(checkpoint_path, args.overwrite or has_saved)
+                if not has_saved:
+                    validate_checkpoint_target(checkpoint_path, args.overwrite)
                 torch.save(checkpoint, temp_path)
                 os.replace(temp_path, checkpoint_path)
                 has_saved = True

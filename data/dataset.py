@@ -256,37 +256,51 @@ IMAGENET_MEAN = [0.485, 0.456, 0.406]
 IMAGENET_STD = [0.229, 0.224, 0.225]
 
 
-# 训练集预处理。
-# 训练集允许加入随机操作，增加图片变化，减少模型死记硬背。
-train_transform = transforms.Compose(
-    [
-        # 将图片较短的一边缩放到256。
+SUPPORTED_AUGMENTATIONS = ("basic", "randaugment")
+
+
+def build_train_transform(augmentation="basic"):
+    """
+    根据实验配置创建训练集预处理。
+
+    basic：
+        Resize + RandomCrop + RandomHorizontalFlip
+
+    randaugment：
+        在 basic 的基础上增加 RandAugment(num_ops=2, magnitude=9)
+    """
+
+    if augmentation not in SUPPORTED_AUGMENTATIONS:
+        raise ValueError(
+            f"未知的数据增强方式：{augmentation}；"
+            f"可选值：{SUPPORTED_AUGMENTATIONS}"
+        )
+
+    operations = [
         transforms.Resize(256),
-
-        # 随机裁剪一个224×224的区域。
         transforms.RandomCrop(224),
-
-        # 以50%的概率水平翻转图片。
         transforms.RandomHorizontalFlip(),
-
-        # 将PIL图片转换为PyTorch张量。
-        #
-        # 转换前通常是：
-        # 高 × 宽 × 通道，像素范围0～255。
-        #
-        # 转换后是：
-        # 通道 × 高 × 宽，像素范围0～1。
-        transforms.ToTensor(),
-
-        # 使用ImageNet参数标准化。
-        # Normalize必须放在ToTensor之后。
-        transforms.Normalize(
-            mean=IMAGENET_MEAN,
-            std=IMAGENET_STD,
-        ),
     ]
-)
 
+    if augmentation == "randaugment":
+        operations.append(
+            transforms.RandAugment(
+                num_ops=2,
+                magnitude=9,
+            )
+        )
+
+    operations.extend(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=IMAGENET_MEAN,
+                std=IMAGENET_STD,
+            ),
+        ]
+    )
+
+    return transforms.Compose(operations)
 
 # 验证集和测试集预处理。
 # 这里不能使用随机裁剪或随机翻转，
@@ -359,7 +373,7 @@ class TransformedSubset(Dataset):
 # 8. 创建DataLoader
 # ============================================================
 
-def create_dataloaders(batch_size=BATCH_SIZE, num_workers=0, download=False):
+def create_dataloaders(batch_size=BATCH_SIZE, num_workers=0, download=False,augmentation="basic"):
     """
     完成完整的数据流水线：
 
@@ -396,6 +410,10 @@ def create_dataloaders(batch_size=BATCH_SIZE, num_workers=0, download=False):
         val_indices,
         test_indices,
         targets,
+    )
+    # 根据 augmentation 参数创建本次实验使用的训练集预处理。
+    train_transform = build_train_transform(
+        augmentation
     )
 
     # 训练集使用带有随机增强的预处理。
