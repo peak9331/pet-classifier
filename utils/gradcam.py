@@ -16,7 +16,7 @@ from data.dataset import create_dataloaders
 from utils.checkpoints import CLASS_NAMES, load_trained_model
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent[1]
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DEFAULT_CHECKPOINT = (
     PROJECT_ROOT
     / "checkpoints"
